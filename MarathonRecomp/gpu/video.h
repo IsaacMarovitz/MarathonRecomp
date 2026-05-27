@@ -230,6 +230,30 @@ struct GuestSurfaceCreateParams
     be<int32_t> colorExpBias;
 };
 
+// EDRAM region tracking types
+using EDRAMRegionID = uint32_t;
+
+struct EDRAMRegion
+{
+    EDRAMRegionID id = 0;
+    uint32_t baseTile = 0;
+    uint32_t tileCount = 0;
+    uint64_t writeEpoch = 0;
+    GuestSurface* activeSurface = nullptr;
+    std::vector<GuestSurface*> aliases;
+};
+
+struct HostSurfaceResources
+{
+    std::unique_ptr<RenderTexture> renderTexture;
+    RenderTexture* resolveTexture = nullptr;   // raw, may point to renderTexture or owned separately
+    std::unique_ptr<RenderTexture> ownedResolveTexture; // only used if MSAA
+    RenderSampleCounts sampleCount = RenderSampleCount::COUNT_1;
+    bool resolveDirty = false;
+    uint64_t renderEpoch = 0;
+    uint64_t resolveEpoch = 0;
+};
+
 // RenderTarget/DepthStencil
 struct GuestSurface : GuestBaseTexture
 {
@@ -238,6 +262,14 @@ struct GuestSurface : GuestBaseTexture
     RenderSampleCounts sampleCount = RenderSampleCount::COUNT_1;
     ankerl::unordered_dense::map<GuestTexture*, uint32_t> destinationTextures;
     bool wasCached = false;
+
+    // EDRAM / MSAA tracking
+    EDRAMRegionID regionID = 0;
+    uint64_t lastWriteEpoch = 0;
+    uint64_t lastResolveEpoch = 0;
+    bool participatesInResolve = false;
+    bool hostAliasingDisabled = false;
+    HostSurfaceResources host;
 };
 
 enum GuestDeclType

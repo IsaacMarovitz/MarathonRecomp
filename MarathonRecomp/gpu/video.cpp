@@ -396,6 +396,10 @@ static constexpr uint32_t CONDITIONAL_SURVEY_MAX = 64;
 static std::unique_ptr<RenderBuffer> g_conditionalSurveyBuffer;
 static std::unique_ptr<RenderDescriptorSet> g_conditionalSurveyDescriptorSet;
 
+// EDRAM region tracking
+static std::unordered_map<EDRAMRegionID, EDRAMRegion> g_edramRegions;
+static uint64_t g_globalEDRAMEpoch = 1;
+
 enum
 {
     TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D,
@@ -879,7 +883,6 @@ enum class CsdFilterState
 static CsdFilterState g_csdFilterState;
 
 static ankerl::unordered_dense::set<GuestSurface*> g_pendingSurfaceCopies;
-static ankerl::unordered_dense::set<GuestSurface*> g_pendingResolves;
 
 enum class RenderCommandType
 {
@@ -1731,6 +1734,121 @@ static void CreateImGuiBackend()
         fclose(file);
     }
 #endif
+}
+
+// ----------------------------------------------------------------------------
+// EDRAM & MSAA helpers
+// ----------------------------------------------------------------------------
+
+static EDRAMRegionID ComputeEDRAMRegionID(uint32_t baseTile, uint32_t tileCount)
+{
+    return (baseTile << 16) ^ tileCount;
+}
+
+static EDRAMRegion& AcquireEDRAMRegion(GuestSurface* surface, uint32_t baseTile, uint32_t tileCount)
+{
+    EDRAMRegionID id = ComputeEDRAMRegionID(baseTile, tileCount);
+    auto iter = g_edramRegions.find(id);
+    if (iter == g_edramRegions.end())
+    {
+        EDRAMRegion region;
+        region.id = id;
+        region.baseTile = baseTile;
+        region.tileCount = tileCount;
+        iter = g_edramRegions.emplace(id, std::move(region)).first;
+    }
+
+    EDRAMRegion& region = iter->second;
+    region.activeSurface = surface;
+
+    bool found = false;
+    for (GuestSurface* alias : region.aliases)
+    {
+        if (alias == surface)
+        {
+            found = true;
+            break;
+        }
+    }
+    if (!found)
+        region.aliases.push_back(surface);
+
+    surface->regionID = id;
+    return region;
+}
+
+static bool ShouldDisableHostAliasing(GuestSurface* surface)
+{
+    if (surface->sampleCount != RenderSampleCount::COUNT_1)
+        return true;
+    if (RenderFormatIsDepth(surface->format))
+        return true;
+    if (surface->participatesInResolve)
+        return true;
+    return false;
+}
+
+static void ResolveSurface(GuestSurface* surface)
+{
+    if (!surface) return;
+    if (surface->sampleCount == RenderSampleCount::COUNT_1) return;
+    if (!surface->host.resolveDirty) return;
+
+    auto& cmdList = g_commandLists[g_frame];
+
+    if (RenderFormatIsDepth(surface->format))
+    {
+        if (g_capabilities.resolveModes)
+        {
+            cmdList->resolveTextureRegion(
+                surface->host.ownedResolveTexture.get(), 0, 0,
+                surface->host.renderTexture.get(), nullptr, RenderResolveMode::MIN);
+        }
+        else
+        {
+            cmdList->copyTextureRegion(
+                RenderTextureCopyLocation::Subresource(surface->host.ownedResolveTexture.get(), 0),
+                RenderTextureCopyLocation::Subresource(surface->host.renderTexture.get(), 0));
+        }
+    }
+    else
+    {
+        cmdList->resolveTexture(
+            surface->host.ownedResolveTexture.get(),
+            surface->host.renderTexture.get());
+    }
+
+    surface->host.resolveDirty = false;
+    surface->host.resolveEpoch = g_globalEDRAMEpoch;
+    surface->lastResolveEpoch = g_globalEDRAMEpoch;
+}
+
+static void EnsureResolved(GuestSurface* surface)
+{
+    if (!surface) return;
+    if (surface->sampleCount == RenderSampleCount::COUNT_1) return;
+
+    auto iter = g_edramRegions.find(surface->regionID);
+    if (iter == g_edramRegions.end())
+        return;
+
+    EDRAMRegion& region = iter->second;
+    if (surface->lastResolveEpoch != region.writeEpoch)
+        ResolveSurface(surface);
+}
+
+static void MarkSurfaceWritten(GuestSurface* surface)
+{
+    if (!surface) return;
+    auto iter = g_edramRegions.find(surface->regionID);
+    if (iter == g_edramRegions.end())
+        return;
+
+    EDRAMRegion& region = iter->second;
+    ++g_globalEDRAMEpoch;
+    region.writeEpoch = g_globalEDRAMEpoch;
+    surface->lastWriteEpoch = g_globalEDRAMEpoch;
+    surface->host.resolveDirty = true;
 }
 
 static void CheckSwapChain()
@@ -3554,9 +3672,7 @@ static GuestBuffer* CreateIndexBuffer(uint32_t length, uint32_t, uint32_t format
 
 static std::vector<std::pair<GuestSurface*, uint32_t>> g_surfaceCache;
 
-// TODO: Singleplayer (possibly) uses the same memory location in EDRAM for HDR and FB0 surfaces,
-// so we just remember who was created first and use that instead of creating a new one.
-static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t format, uint32_t multiSample, GuestSurfaceCreateParams* params) 
+static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t format, uint32_t multiSample, GuestSurfaceCreateParams* params)
 {
     GuestSurface* surface = nullptr;
     uint32_t baseValue = params ? params->base.get() : -1;
@@ -3575,7 +3691,6 @@ static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t for
         }
     }
     if (!surface) {
-        // printf("CreateSurface: w: %d, h: %d, f: %d, ms: %d\n", width, height, format, multiSample);
         RenderTextureDesc desc;
         desc.dimension = RenderTextureDimension::TEXTURE_2D;
         desc.width = width;
@@ -3583,7 +3698,6 @@ static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t for
         desc.depth = 1;
         desc.mipLevels = 1;
         desc.arraySize = 1;
-        // desc.multisampling.sampleCount = multiSample != 0 && Config::AntiAliasing != EAntiAliasing::None ? int32_t(Config::AntiAliasing.Value) : RenderSampleCount::COUNT_1;
         if (multiSample == 0) {
             desc.multisampling.sampleCount = RenderSampleCount::COUNT_1;
         } else {
@@ -3595,35 +3709,60 @@ static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t for
         surface = g_userHeap.AllocPhysical<GuestSurface>(RenderFormatIsDepth(desc.format) ?
             ResourceType::DepthStencil : ResourceType::RenderTarget);
 
-        surface->textureHolder = g_device->createTexture(desc);
-        surface->texture = surface->textureHolder.get();
+        // Create render texture
+        surface->host.renderTexture = g_device->createTexture(desc);
+        surface->host.sampleCount = desc.multisampling.sampleCount;
+
+        // Create resolve texture if MSAA
+        if (desc.multisampling.sampleCount != RenderSampleCount::COUNT_1)
+        {
+            RenderTextureDesc resolveDesc = desc;
+            resolveDesc.multisampling.sampleCount = RenderSampleCount::COUNT_1;
+            surface->host.ownedResolveTexture = g_device->createTexture(resolveDesc);
+            surface->host.resolveTexture = surface->host.ownedResolveTexture.get();
+        }
+        else
+        {
+            surface->host.resolveTexture = surface->host.renderTexture.get();
+        }
+
+        // For shader reads, we use the resolve texture
+        RenderTextureViewDesc viewDesc;
+        viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+        viewDesc.format = desc.format;
+        viewDesc.mipLevels = 1;
+        surface->textureView = surface->host.resolveTexture->createTextureView(viewDesc);
+        surface->texture = surface->host.resolveTexture;   // ← only this assignment
+
         surface->width = width;
         surface->height = height;
         surface->format = desc.format;
         surface->guestFormat = format;
         surface->sampleCount = desc.multisampling.sampleCount;
 
-        RenderTextureViewDesc viewDesc;
-        viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
-        viewDesc.format = desc.format;
-        viewDesc.mipLevels = 1;
-        surface->textureView = surface->textureHolder->createTextureView(viewDesc);
         surface->descriptorIndex = g_textureDescriptorAllocator.allocate();
-        g_textureDescriptorSet->setTexture(surface->descriptorIndex, surface->textureHolder.get(), RenderTextureLayout::SHADER_READ, surface->textureView.get());
+        g_textureDescriptorSet->setTexture(surface->descriptorIndex, surface->texture, RenderTextureLayout::SHADER_READ, surface->textureView.get());
 
-    #ifdef _DEBUG 
-        surface->texture->setName(fmt::format("{} {:X}", desc.flags & RenderTextureFlag::RENDER_TARGET ? "Render Target" : "Depth Stencil", g_memory.MapVirtual(surface)));
-    #endif
-
-        DiscardTexture(surface, desc.flags == RenderTextureFlag::RENDER_TARGET ?
-            RenderTextureLayout::COLOR_WRITE : RenderTextureLayout::DEPTH_WRITE);
+        // EDRAM / MSAA flags
+        surface->participatesInResolve = (desc.multisampling.sampleCount != RenderSampleCount::COUNT_1);
+        surface->hostAliasingDisabled = ShouldDisableHostAliasing(surface);
 
         if (params) {
             surface->wasCached = true;
             g_surfaceCache.emplace_back(surface, baseValue);
         }
-    }
 
+        // Acquire EDRAM region (for tiling)
+        if (params && params->base.get() != -1)
+        {
+            // base is tile index, we assume tileCount based on surface size (1 tile = 80x80)
+            uint32_t tileCount = ((width + 79) / 80) * ((height + 79) / 80);
+            AcquireEDRAMRegion(surface, params->base.get(), tileCount);
+        }
+
+        DiscardTexture(surface, desc.flags == RenderTextureFlag::RENDER_TARGET ?
+            RenderTextureLayout::COLOR_WRITE : RenderTextureLayout::DEPTH_WRITE);
+    }
     return surface;
 }
 
@@ -3674,30 +3813,26 @@ static void SetSurface(uint32_t index, GuestSurface* surface);
 static void ProcStretchRect(const RenderCommand& cmd)
 {
     const auto& args = cmd.stretchRect;
-
     const bool isDepthStencil = (args.flags & 0x4) != 0;
     const auto surface = isDepthStencil ? g_depthStencil : g_renderTarget;
 
-    // Erase previous pending command so it doesn't cause the texture to be overriden.
     if (args.texture->sourceSurface != nullptr)
         args.texture->sourceSurface->destinationTextures.erase(args.texture);
 
     args.texture->sourceSurface = surface;
-    // printf("ProcStretchRect: surface - %x %x ? (%x : %x)\n", surface, isDepthStencil, g_depthStencil, g_renderTarget);
     surface->destinationTextures.emplace(args.texture, args.destSliceOrFace);
 
-    // If the texture is assigned to any slots, set it again. This'll also push the barrier.
+    // For each texture slot, if this texture is bound, we must use the resolved version
     for (uint32_t i = 0; i < std::size(g_textures); i++)
     {
         if (g_textures[i] == args.texture)
         {
-            // TODO: Render depth directly to slice and avoid copy
-            // Set the original texture for MSAA and surface-to-array textures as they always get resolved.
             if (surface->sampleCount != RenderSampleCount::COUNT_1 ||
                 args.texture->type == ResourceType::ArrayTexture)
             {
+                // Ensure the source surface is resolved before using it as a texture
+                EnsureResolved(surface);
                 SetTextureInRenderThread(i, args.texture);
-                g_pendingResolves.emplace(surface);
             }
             else
             {
@@ -3706,7 +3841,6 @@ static void ProcStretchRect(const RenderCommand& cmd)
         }
     }
 
-    // Remember to clear later.
     g_pendingSurfaceCopies.emplace(surface);
 }
 
@@ -3922,6 +4056,7 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                     }
 
                     auto& framebuffer = texture->framebuffers[slice];
+
                     if (framebuffer == nullptr)
                     {
                         if (isDepthStencil)
@@ -4014,26 +4149,24 @@ static void ProcExecutePendingStretchRectCommands(const RenderCommand& cmd)
     }
 
     g_pendingSurfaceCopies.clear();
-    g_pendingResolves.clear();
 }
 
 static void SetFramebuffer(GuestSurface* renderTarget, GuestSurface* depthStencil, bool settingForClear)
 {
     if (settingForClear || g_dirtyStates.renderTargetAndDepthStencil)
     {
-        // printf("SetFramebuffer %x %x\n", renderTarget, depthStencil);
         GuestSurface* framebufferContainer = nullptr;
         RenderTexture* framebufferKey = nullptr;
 
         if (renderTarget != nullptr && depthStencil != nullptr)
         {
-            framebufferContainer = depthStencil; // Backbuffer texture changes per frame so we can't use the depth stencil as the key.
+            framebufferContainer = depthStencil;
             framebufferKey = renderTarget->texture;
         }
         else if (renderTarget != nullptr && depthStencil == nullptr)
         {
             framebufferContainer = renderTarget;
-            framebufferKey = renderTarget->texture; // Backbuffer texture changes per frame so we can't assume nullptr for it.
+            framebufferKey = renderTarget->texture;
         }
         else if (renderTarget == nullptr && depthStencil != nullptr)
         {
@@ -4068,6 +4201,10 @@ static void SetFramebuffer(GuestSurface* renderTarget, GuestSurface* depthStenci
                 commandList->setFramebuffer(framebuffer.get());
                 g_framebuffer = framebuffer.get();
             }
+
+            // Mark that we are writing to these surfaces
+            if (renderTarget) MarkSurfaceWritten(renderTarget);
+            if (depthStencil) MarkSurfaceWritten(depthStencil);
         }
         else if (g_framebuffer != nullptr)
         {
@@ -4229,27 +4366,39 @@ static void ProcSetTexture(const RenderCommand& cmd)
 {
     const auto& args = cmd.setTexture;
 
-    // If a pending copy operation is detected, set the source surface. The indices will be fixed later if flushing is necessary.
     bool shouldSetTexture = true;
     if (args.texture != nullptr && args.texture->sourceSurface != nullptr)
     {
-        // TODO: Render depth directly to slice and avoid copy
-        // MSAA surfaces or surface-to-array need to be resolved and cannot be used directly.
-        if (args.texture->sourceSurface->sampleCount != RenderSampleCount::COUNT_1 ||
+        GuestSurface* sourceSurface = args.texture->sourceSurface;
+        if (sourceSurface->sampleCount != RenderSampleCount::COUNT_1 ||
             args.texture->type == ResourceType::ArrayTexture)
         {
-            g_pendingResolves.emplace(args.texture->sourceSurface);
+            // Need to resolve before sampling
+            EnsureResolved(sourceSurface);
+            SetSurface(args.index, sourceSurface);
         }
         else
         {
-            SetSurface(args.index, args.texture->sourceSurface);
-            shouldSetTexture = false;
+            SetSurface(args.index, sourceSurface);
+        }
+        shouldSetTexture = false;
+    }
+
+    if (shouldSetTexture)
+    {
+        // If the texture is actually a render target surface, use its resolve texture for reading
+        if (args.texture && (args.texture->type == ResourceType::RenderTarget || args.texture->type == ResourceType::DepthStencil))
+        {
+            GuestSurface* surf = reinterpret_cast<GuestSurface*>(args.texture);
+            EnsureResolved(surf);
+            SetSurface(args.index, surf);
+        }
+        else
+        {
+            SetTextureInRenderThread(args.index, args.texture);
         }
     }
-    
-    if (shouldSetTexture)
-        SetTextureInRenderThread(args.index, args.texture);
-    
+
     g_textures[args.index] = args.texture;
 }
 
@@ -4970,31 +5119,11 @@ static void FlushRenderStateForRenderThread()
     auto renderTarget = g_pipelineState.colorWriteEnable ? g_renderTarget : nullptr;
     auto depthStencil = g_pipelineState.zEnable || g_pipelineState.stencilEnable ? g_depthStencil : nullptr;
 
-    bool foundAny = PopulateBarriersForStretchRect(renderTarget, depthStencil);
+    if (renderTarget) MarkSurfaceWritten(renderTarget);
+    if (depthStencil) MarkSurfaceWritten(depthStencil);
 
-    for (const auto surface : g_pendingResolves)
-    {
-        bool isDepthStencil = RenderFormatIsDepth(surface->format);
-        foundAny |= PopulateBarriersForStretchRect(isDepthStencil ? nullptr : surface, isDepthStencil ? surface : nullptr);
-    }
-
-    if (foundAny)
-    {
-        FlushBarriers();
-        ExecutePendingStretchRectCommands(renderTarget, depthStencil);
-
-        for (const auto surface : g_pendingResolves)
-        {
-            bool isDepthStencil = RenderFormatIsDepth(surface->format);
-            ExecutePendingStretchRectCommands(isDepthStencil ? nullptr : surface, isDepthStencil ? surface : nullptr);
-        }
-    }
-
-    if (!g_pendingResolves.empty())
-        g_pendingResolves.clear();
-
-    AddBarrier(renderTarget, RenderTextureLayout::COLOR_WRITE);
-    AddBarrier(depthStencil, RenderTextureLayout::DEPTH_WRITE);
+    if (renderTarget) AddBarrier(renderTarget, RenderTextureLayout::COLOR_WRITE);
+    if (depthStencil) AddBarrier(depthStencil, RenderTextureLayout::DEPTH_WRITE);
 
     FlushBarriers();
 
